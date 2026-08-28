@@ -38,7 +38,7 @@ No third-party packages required.
 
 ## Installation
 
-Copy the two files from [`dist/NukeDrawDots-1.0.0/`](dist/NukeDrawDots-1.0.0) into `~/.nuke/` and restart Nuke.
+Copy the two files from [`dist/NukeDrawDots-1.1.0/`](dist/NukeDrawDots-1.1.0) into `~/.nuke/` and restart Nuke.
 
 > If you already have a `~/.nuke/menu.py`, don't overwrite it — append the distributed `menu.py` to the end of yours instead.
 
@@ -227,7 +227,7 @@ NukeDrawDots/
 │   ├── nuke_draw_dots.py         # Main tool — copy this to ~/.nuke/
 │   └── menu.py                   # menu.py snippet to append
 ├── dist/
-│   └── NukeDrawDots-1.0.0/       # Ready-to-install payload
+│   └── NukeDrawDots-1.1.0/       # Ready-to-install payload
 ├── tools/
 │   ├── test_geometry.py          # Path maths, plain CPython
 │   ├── test_import.py            # Qt layer + Dot wiring, headless

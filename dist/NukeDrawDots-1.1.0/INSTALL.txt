@@ -1,4 +1,4 @@
-NukeDrawDots 1.0.0
+NukeDrawDots 1.1.0
 ==========================
 
 Draw a freehand path in the Node Graph and turn it into a chain of
