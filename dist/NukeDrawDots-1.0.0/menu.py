@@ -19,3 +19,12 @@ toolbar.addCommand(
     "shift+d",
     icon="Dot.png",
 )
+
+# Simplify strength, right angles, grid snap and connecting - set once and
+# remembered. Also has "Show this panel after every stroke" if you would
+# rather confirm each path with a live preview.
+toolbar.addCommand(
+    "Other/Draw Dots Settings...",
+    "nuke_draw_dots.show_settings()",
+    icon="Dot.png",
+)

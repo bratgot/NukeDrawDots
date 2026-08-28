@@ -72,6 +72,21 @@ MAX_TOLERANCE     = 150
 
 CONNECT_ENDS      = True   # Wire the chain into nodes under the stroke ends
 CONNECT_RADIUS    = 45     # How near an end must be to a node, in DAG units
+PIPE_RADIUS       = 30     # How near an end must be to a pipe to splice it
+ON_NODE_RADIUS    = 6      # Within this of a node's box counts as "on" it
+
+# Clearance kept around a node the chain wires into. No Dot is placed
+# inside it: drawing onto a node is the connect gesture, and a Dot parked
+# against the node's edge is clutter rather than routing. Wide enough that
+# a Dot never appears to touch the node, narrow enough to leave room for
+# one in the gap between two stacked nodes.
+TRIM_PADDING      = 30
+
+# How far a Dot must sit off the straight line between its neighbours to
+# be worth keeping, in DAG units. A Dot that does not change the route's
+# direction adds nothing, so a straight run between two nodes becomes a
+# plain connection with no Dots at all.
+STRAIGHT_TOL      = 12
 
 DOT_SIZE          = 12     # Fallback Dot width when screenWidth() reads 0
 UNDO_NAME         = "Draw Dots"
@@ -96,6 +111,7 @@ _DEFAULT_PREFS = {
     "snap":      DEFAULT_SNAP,
     "grid":      DEFAULT_GRID,
     "connect":   CONNECT_ENDS,
+    "ask":       False,     # Show the panel after every stroke
 }
 
 
@@ -465,7 +481,12 @@ class _DagTransform(object):
             centre = nuke.center()
             self.cx, self.cy = float(centre[0]), float(centre[1])
         except Exception:
+            # Falling back to the origin silently would put every Dot in
+            # the wrong place, and look exactly like the tool ignoring
+            # what was drawn. Say so.
             self.cx, self.cy = 0.0, 0.0
+            print("[DD] nuke.center() failed - Dots will be misplaced")
+            print(traceback.format_exc())
 
         _log("transform: zoom={:.3f} centre=({:.0f},{:.0f}) "
              "size={:.0f}x{:.0f} origin=({:.0f},{:.0f})".format(
@@ -488,10 +509,210 @@ class _DagTransform(object):
                             int(self.w), int(self.h))
 
 
+MAX_INPUT_SEARCH = 64   # Merge2 reports a very large maxInputs()
+
+
+def _free_input(node):
+    """
+    Index of the first unconnected input on node, or None if every pipe
+    is taken.
+
+    The mask/optional input is skipped. On a Merge it sits between A and
+    the extra A inputs, and routing an image into it is never what the
+    stroke meant - without this, a Merge with B and A full would quietly
+    take the connection into its mask.
+    """
+    try:
+        maximum = min(int(node.maxInputs()), MAX_INPUT_SEARCH)
+    except Exception:
+        return None
+
+    optional = -1
+    try:
+        optional = int(node.optionalInput())
+    except Exception:
+        pass
+
+    for index in range(maximum):
+        if index == optional:
+            continue
+        try:
+            if node.input(index) is None:
+                return index
+        except Exception:
+            continue
+    return None
+
+
+def _input_label(node, index):
+    """A readable name for an input, falling back to its number."""
+    if index is None:
+        return "?"
+    try:
+        name = node.inputName(index)
+        if name:
+            return name
+    except Exception:
+        pass
+    return "input {}".format(index)
+
+
 def _node_rect(node):
     w = node.screenWidth() or 80
     h = node.screenHeight() or 18
     return node.xpos(), node.ypos(), w, h
+
+
+def _node_centre(node):
+    nx, ny, nw, nh = _node_rect(node)
+    return (nx + nw / 2.0, ny + nh / 2.0)
+
+
+def _pipe_near(x, y, radius=None):
+    """
+    The connection nearest to a DAG point, as (upstream, downstream,
+    input_index), or None.
+
+    A pipe is approximated by the segment between the two node centres.
+    Nuke draws it edge to edge, but the visible line lies along that
+    segment, so the distance test matches what the eye sees.
+    """
+    if radius is None:
+        radius = PIPE_RADIUS
+
+    best, best_d = None, None
+    try:
+        nodes = nuke.allNodes()
+    except Exception:
+        return None
+
+    for node in nodes:
+        if node.Class() in ("BackdropNode", "StickyNote"):
+            continue
+        try:
+            maximum = min(int(node.maxInputs()), MAX_INPUT_SEARCH)
+        except Exception:
+            continue
+        for index in range(maximum):
+            try:
+                upstream = node.input(index)
+                if upstream is None:
+                    continue
+                a = _node_centre(upstream)
+                b = _node_centre(node)
+            except Exception:
+                continue
+            distance = _point_line_distance((x, y), a, b)
+            if distance <= radius and (best_d is None or distance < best_d):
+                best_d = distance
+                best = (upstream, node, index)
+    return best
+
+
+def _resolve_connections(raw_dag):
+    """
+    What the two ends of a stroke should wire into.
+
+    Returns (start_node, end_node, end_input, inserting). A node under an
+    end wins; failing that, a connection under the end is spliced - the
+    chain takes over that pipe, so upstream -> dots -> downstream. When
+    the stroke also started on a node, that node is kept as the source
+    rather than the pipe's upstream: the user drew from it deliberately.
+    """
+    if not CONNECT_ENDS or not raw_dag:
+        return None, None, None, False
+
+    start_x, start_y = raw_dag[0]
+    end_x, end_y = raw_dag[-1]
+
+    # Landing squarely ON a node means connect to it. Being merely NEAR
+    # one must not count yet: nodes joined by a short pipe sit within
+    # CONNECT_RADIUS of every point along it, so proximity tested first
+    # swallows the whole pipe and nothing can ever be spliced onto it.
+    # Both ends use the strict test here; the generous one is a fallback
+    # further down, once splicing has had its chance.
+    start_node = _node_near(start_x, start_y, ON_NODE_RADIUS)
+    end_node = _node_near(end_x, end_y, ON_NODE_RADIUS, need_input=True)
+    if end_node is not None and end_node is start_node:
+        end_node = None
+
+    end_input = None
+    inserting = False
+
+    if end_node is None:
+        # A pipe under either end splices. Ending on one is "route this
+        # connection over there"; starting on one is "pull a route out of
+        # this connection to here" - the more natural gesture of the two,
+        # and the one that leaves the stroke's far end in empty space.
+        pipe = _pipe_near(end_x, end_y)
+        at = "end"
+        if pipe is None and start_node is None:
+            pipe = _pipe_near(start_x, start_y)
+            at = "start"
+        if pipe is not None:
+            upstream, downstream, index = pipe
+            if upstream is not downstream:
+                end_node, end_input, inserting = downstream, index, at
+                if start_node is None or start_node is downstream:
+                    # Either nothing was under the start, or it landed on
+                    # the very node being spliced into - which would be a
+                    # loop. Take the pipe's own upstream instead, making
+                    # this a true insertion.
+                    start_node = upstream
+                _log("splicing into {} -> {} ({})".format(
+                    upstream.name(), downstream.name(),
+                    _input_label(downstream, index)))
+
+    # Proximity is the fallback, reached only when neither end landed on
+    # anything and no pipe was found. This is what lets a stroke ending in
+    # clear space beside a node still connect to it.
+    if start_node is None:
+        start_node = _node_near(start_x, start_y, CONNECT_RADIUS)
+    if end_node is None:
+        end_node = _node_near(end_x, end_y, CONNECT_RADIUS, need_input=True)
+        if end_node is not None and end_node is start_node:
+            end_node = None
+
+    if end_node is not None and end_input is None:
+        end_input = _free_input(end_node)
+
+    _log("connections: start={} end={} input={} inserting={}".format(
+        start_node.name() if start_node else None,
+        end_node.name() if end_node else None, end_input, inserting))
+    return start_node, end_node, end_input, inserting
+
+
+def _point_on_node(point, node, padding=TRIM_PADDING):
+    """True if a DAG point lands on a node's box."""
+    if node is None:
+        return False
+    try:
+        nx, ny, nw, nh = _node_rect(node)
+    except Exception:
+        return False
+    x, y = point
+    return (nx - padding <= x <= nx + nw + padding and
+            ny - padding <= y <= ny + nh + padding)
+
+
+def _trim_endpoints(points, start_node=None, end_node=None):
+    """
+    Drop points sitting on a node the chain is being wired into.
+
+    Drawing across a node is how you say "connect here", so a Dot placed
+    on top of that node is just in the way - the connection already
+    expresses it. Only the ends are trimmed; a stroke deliberately routed
+    over a node in the middle keeps its Dots.
+    """
+    trimmed = list(points)
+    while len(trimmed) > 1 and _point_on_node(trimmed[0], start_node):
+        trimmed.pop(0)
+    while len(trimmed) > 1 and _point_on_node(trimmed[-1], end_node):
+        trimmed.pop()
+    if len(trimmed) == 1 and (_point_on_node(trimmed[0], start_node) or
+                              _point_on_node(trimmed[0], end_node)):
+        return []
+    return trimmed
 
 
 def _node_near(x, y, radius, need_input=False):
@@ -513,7 +734,10 @@ def _node_near(x, y, radius, need_input=False):
             continue
         try:
             if need_input:
-                if node.maxInputs() < 1:
+                # A node with every pipe taken is not offered: connecting
+                # would have to overwrite an existing link, which the
+                # stroke never asked for.
+                if node.maxInputs() < 1 or _free_input(node) is None:
                     continue
             elif cls == "Viewer":
                 continue
@@ -603,6 +827,146 @@ class _PathOverlay(QtWidgets.QWidget):
         painter.end()
 
 
+# -- Shared controls -------------------------------------------
+
+def _build_path_controls(form, prefs, owner):
+    """
+    Add the Simplify / Right angles / Snap rows to a QGridLayout and hang
+    the widgets off owner as _slider, _tol_label, _ortho, _snap, _grid.
+
+    Both the after-a-stroke panel and the settings panel show exactly
+    these three controls, so they are built in one place.
+    """
+    owner._slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+    owner._slider.setRange(0, MAX_TOLERANCE)
+    owner._slider.setValue(int(prefs["tolerance"]))
+    owner._slider.setMinimumWidth(200)
+    owner._slider.setToolTip(
+        "How far the path may stray from the stroke, in Node Graph units.")
+    owner._tol_label = QtWidgets.QLabel()
+    owner._tol_label.setMinimumWidth(28)
+    form.addWidget(QtWidgets.QLabel("Simplify"), 0, 0)
+    form.addWidget(owner._slider, 0, 1)
+    form.addWidget(owner._tol_label, 0, 2)
+
+    owner._ortho = QtWidgets.QCheckBox("Right angles")
+    owner._ortho.setChecked(bool(prefs["ortho"]))
+    owner._ortho.setToolTip(
+        "Snap every segment to horizontal or vertical.")
+    form.addWidget(owner._ortho, 1, 1, 1, 2)
+
+    grid_row = QtWidgets.QHBoxLayout()
+    owner._snap = QtWidgets.QCheckBox("Snap to grid")
+    owner._snap.setChecked(bool(prefs["snap"]))
+    owner._grid = QtWidgets.QSpinBox()
+    owner._grid.setRange(2, 200)
+    owner._grid.setValue(int(prefs["grid"]))
+    owner._grid.setEnabled(owner._snap.isChecked())
+    grid_row.addWidget(owner._snap)
+    grid_row.addWidget(owner._grid)
+    grid_row.addStretch(1)
+    form.addLayout(grid_row, 2, 1, 1, 2)
+    return 3      # next free row
+
+
+def _build_points(raw_dag, tolerance, orthogonal, grid,
+                  connect=False, start_node=None, end_node=None):
+    """
+    The full stroke -> Dot positions pipeline.
+
+    Shared so the live preview, the panel's result and the no-panel path
+    all produce the same Dots. Trimming runs before simplifying as well as
+    after: orthogonalising and grid snapping move points, so one drawn on
+    a node can be shifted clear of it and survive a later-only trim.
+    """
+    source = raw_dag
+    if connect:
+        source = _trim_endpoints(source, start_node, end_node)
+    points = simplify_path(source, tolerance=tolerance,
+                           orthogonal=orthogonal, grid=grid)
+    if connect:
+        points = _trim_endpoints(points, start_node, end_node)
+        points = _drop_straight_run(points, start_node, end_node)
+    return points
+
+
+def _drop_straight_run(points, start_node=None, end_node=None):
+    """
+    Remove Dots that do not bend the route.
+
+    The nodes at each end are the route's real endpoints, so they are
+    added as anchors before working out which points are redundant.
+    Drawing straight from one node to another then leaves nothing behind
+    and the two are simply wired together: a Dot in the middle of a
+    straight connection is decoration, not routing.
+    """
+    if not points:
+        return points
+
+    head = [_node_centre(start_node)] if start_node is not None else []
+    tail = [_node_centre(end_node)] if end_node is not None else []
+    if not head and not tail:
+        return points
+
+    try:
+        combined = _drop_collinear(head + list(points) + tail, STRAIGHT_TOL)
+    except Exception:
+        return points
+
+    if head:
+        combined = combined[1:]
+    if tail:
+        combined = combined[:-1]
+    return combined
+
+
+# -- Panel placement -------------------------------------------
+
+def _screen_rect(point):
+    """Usable area of the screen holding point, taskbar excluded."""
+    screen = None
+    try:
+        screen = QtGui.QGuiApplication.screenAt(point)
+    except AttributeError:
+        pass
+    if screen is None:
+        screen = QtGui.QGuiApplication.primaryScreen()
+    if screen is None:
+        return QtCore.QRect(0, 0, 1920, 1080)
+    return screen.availableGeometry()
+
+
+def _panel_position(panel_size, stroke_rect, screen_rect, margin=16):
+    """
+    Where to put the panel so it sits beside the stroke rather than on it.
+
+    Tries right, left, below, then above the stroke's bounding box, taking
+    the first that fits entirely on screen. A panel covering the stroke
+    would hide the very preview it is there to drive.
+    """
+    width = panel_size.width()
+    height = panel_size.height()
+
+    candidates = (
+        (stroke_rect.right() + margin, stroke_rect.top()),
+        (stroke_rect.left() - margin - width, stroke_rect.top()),
+        (stroke_rect.left(), stroke_rect.bottom() + margin),
+        (stroke_rect.left(), stroke_rect.top() - margin - height),
+    )
+    for x, y in candidates:
+        placed = QtCore.QRect(int(x), int(y), width, height)
+        if screen_rect.contains(placed):
+            return placed.topLeft()
+
+    # A stroke spanning the whole screen leaves nowhere clear. Sit beside
+    # it anyway and clamp, so the panel is at least fully visible.
+    x = min(max(stroke_rect.right() + margin, screen_rect.left()),
+            screen_rect.right() - width)
+    y = min(max(stroke_rect.top(), screen_rect.top()),
+            screen_rect.bottom() - height)
+    return QtCore.QPoint(int(x), int(y))
+
+
 # -- Simplify panel --------------------------------------------
 
 class _SimplifyDialog(QtWidgets.QDialog):
@@ -614,7 +978,8 @@ class _SimplifyDialog(QtWidgets.QDialog):
     """
 
     def __init__(self, raw_dag, transform, overlay,
-                 start_node=None, end_node=None, parent=None):
+                 start_node=None, end_node=None, end_input=None,
+                 inserting=False, parent=None):
         super(_SimplifyDialog, self).__init__(parent)
         self.setWindowTitle("Draw Dots")
         self.setWindowFlags(self.windowFlags() |
@@ -625,6 +990,8 @@ class _SimplifyDialog(QtWidgets.QDialog):
         self._overlay = overlay
         self._start_node = start_node
         self._end_node = end_node
+        self._end_input = end_input
+        self._inserting = inserting
         self.points = list(raw_dag)
 
         prefs = _prefs_get()
@@ -633,36 +1000,7 @@ class _SimplifyDialog(QtWidgets.QDialog):
         form.setContentsMargins(12, 12, 12, 8)
         form.setHorizontalSpacing(8)
 
-        # Simplify
-        self._slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self._slider.setRange(0, MAX_TOLERANCE)
-        self._slider.setValue(int(prefs["tolerance"]))
-        self._slider.setMinimumWidth(200)
-        self._tol_label = QtWidgets.QLabel()
-        self._tol_label.setMinimumWidth(28)
-        form.addWidget(QtWidgets.QLabel("Simplify"), 0, 0)
-        form.addWidget(self._slider, 0, 1)
-        form.addWidget(self._tol_label, 0, 2)
-
-        # Right angles
-        self._ortho = QtWidgets.QCheckBox("Right angles")
-        self._ortho.setChecked(bool(prefs["ortho"]))
-        self._ortho.setToolTip(
-            "Snap every segment to horizontal or vertical.")
-        form.addWidget(self._ortho, 1, 1, 1, 2)
-
-        # Grid
-        grid_row = QtWidgets.QHBoxLayout()
-        self._snap = QtWidgets.QCheckBox("Snap to grid")
-        self._snap.setChecked(bool(prefs["snap"]))
-        self._grid = QtWidgets.QSpinBox()
-        self._grid.setRange(2, 200)
-        self._grid.setValue(int(prefs["grid"]))
-        self._grid.setEnabled(self._snap.isChecked())
-        grid_row.addWidget(self._snap)
-        grid_row.addWidget(self._grid)
-        grid_row.addStretch(1)
-        form.addLayout(grid_row, 2, 1, 1, 2)
+        _build_path_controls(form, prefs, self)
 
         # Connect ends
         self._connect = QtWidgets.QCheckBox(self._connect_label())
@@ -689,19 +1027,28 @@ class _SimplifyDialog(QtWidgets.QDialog):
         self._ortho.toggled.connect(self._refresh)
         self._snap.toggled.connect(self._on_snap)
         self._grid.valueChanged.connect(self._refresh)
+        self._connect.toggled.connect(self._refresh)
 
         self._refresh()
 
     # -- helpers -----------------------------------------------
 
     def _connect_label(self):
+        into = ""
+        if self._end_node is not None:
+            into = "{} ({})".format(
+                self._end_node.name(),
+                _input_label(self._end_node, self._end_input))
+        if self._inserting and self._start_node and self._end_node:
+            return "Insert a dot on {} -> {}, rest free".format(
+                self._start_node.name(), into)
         if self._start_node and self._end_node:
             return "Connect {} -> dots -> {}".format(
-                self._start_node.name(), self._end_node.name())
+                self._start_node.name(), into)
         if self._start_node:
             return "Connect from {}".format(self._start_node.name())
         if self._end_node:
-            return "Connect into {}".format(self._end_node.name())
+            return "Connect into {}".format(into)
         return "Connect to nodes at the ends"
 
     def _on_snap(self, checked):
@@ -711,10 +1058,12 @@ class _SimplifyDialog(QtWidgets.QDialog):
     def _refresh(self, *_args):
         tolerance = float(self._slider.value())
         grid = self._grid.value() if self._snap.isChecked() else 0
-        self.points = simplify_path(self._raw,
-                                    tolerance=tolerance,
-                                    orthogonal=self._ortho.isChecked(),
-                                    grid=grid)
+        # The same pipeline the no-panel path uses, so the preview always
+        # shows the Dots that will actually appear.
+        self.points = _build_points(
+            self._raw, tolerance, self._ortho.isChecked(), grid,
+            connect=self.connect_ends(),
+            start_node=self._start_node, end_node=self._end_node)
         self._tol_label.setText(str(int(tolerance)))
         self._count.setText("{} dots".format(len(self.points)))
 
@@ -737,17 +1086,132 @@ class _SimplifyDialog(QtWidgets.QDialog):
         })
 
 
+# -- Settings panel --------------------------------------------
+
+class _SettingsDialog(QtWidgets.QDialog):
+    """
+    The same path controls, set once and remembered, so a stroke can go
+    straight to Dots without stopping to ask.
+    """
+
+    def __init__(self, parent=None):
+        super(_SettingsDialog, self).__init__(parent)
+        self.setWindowTitle("Draw Dots Settings")
+
+        prefs = _prefs_get()
+
+        form = QtWidgets.QGridLayout()
+        form.setContentsMargins(12, 12, 12, 8)
+        form.setHorizontalSpacing(8)
+        row = _build_path_controls(form, prefs, self)
+
+        self._connect = QtWidgets.QCheckBox("Connect to nodes and pipes")
+        self._connect.setChecked(bool(prefs["connect"]))
+        self._connect.setToolTip(
+            "Wire the chain into whatever the stroke starts and ends on.")
+        form.addWidget(self._connect, row, 1, 1, 2)
+
+        self._ask = QtWidgets.QCheckBox("Show this panel after every stroke")
+        self._ask.setChecked(bool(prefs["ask"]))
+        self._ask.setToolTip(
+            "Off: draw and the Dots appear straight away, using these "
+            "settings. On: a panel opens after each stroke with a live "
+            "preview.")
+        form.addWidget(self._ask, row + 1, 1, 1, 2)
+
+        self._saved = QtWidgets.QLabel("")
+        self._saved.setEnabled(False)
+        form.addWidget(self._saved, row + 2, 1, 1, 2)
+
+        # No OK to press: the panel is not modal, so every change is
+        # applied and written straight away. Close is the only button.
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Close)
+        buttons.rejected.connect(self.close)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+        for signal in (self._slider.valueChanged, self._ortho.toggled,
+                       self._grid.valueChanged, self._connect.toggled,
+                       self._ask.toggled):
+            signal.connect(self._apply)
+        self._snap.toggled.connect(self._on_snap)
+        self._tol_label.setText(str(int(self._slider.value())))
+
+    def _on_snap(self, checked):
+        self._grid.setEnabled(checked)
+        self._apply()
+
+    def _apply(self, *_args):
+        """Write every change through to the prefs file immediately."""
+        self._tol_label.setText(str(int(self._slider.value())))
+        self.save_prefs()
+        self._saved.setText("Saved - applies to the next stroke")
+
+    def save_prefs(self):
+        _prefs_save({
+            "tolerance": int(self._slider.value()),
+            "ortho":     bool(self._ortho.isChecked()),
+            "snap":      bool(self._snap.isChecked()),
+            "grid":      int(self._grid.value()),
+            "connect":   bool(self._connect.isChecked()),
+            "ask":       bool(self._ask.isChecked()),
+        })
+
+
+_settings_dialog = None
+
+
+def show_settings():
+    """
+    Open the settings panel. Wired to a menu command.
+
+    Non-modal, so it can stay open beside the Node Graph while you draw -
+    every change is saved as it is made and applies to the next stroke.
+    """
+    global _settings_dialog
+    if _settings_dialog is not None:
+        try:
+            _settings_dialog.close()
+            _settings_dialog.deleteLater()
+        except RuntimeError:
+            pass
+    parent = QtWidgets.QApplication.activeWindow()
+    _settings_dialog = _SettingsDialog(parent)
+    _settings_dialog.show()
+    _settings_dialog.raise_()
+    return _settings_dialog
+
+
 # -- Dot creation ----------------------------------------------
 
-def create_dot_chain(points, start_node=None, end_node=None):
+def create_dot_chain(points, start_node=None, end_node=None,
+                     end_input=None, insert_at_first=False):
     """
     Build a chain of connected Dots through points, given in DAG
     coordinates as the centre each Dot should sit on.
 
+    One point is enough: trimming the ends of a stroke drawn between two
+    adjacent nodes legitimately leaves a single Dot. Degenerate strokes
+    are rejected before the panel ever opens.
+
+    An empty points list is not an error when both nodes are given: it
+    means the route was straight, and the two are wired directly to each
+    other with no Dots in between.
+
+    end_input names the pipe on end_node to wire into; when omitted the
+    first free one is found.
+
+    insert_at_first wires end_node to the FIRST Dot rather than the last.
+    That is what splicing onto a pipe means: the connection runs through
+    the Dot sitting on the line, and everything drawn after it hangs off
+    that Dot as a branch whose end is left free to wire up by hand.
     The whole chain is one undo step.
     """
-    if len(points) < MIN_POINTS:
-        _log("only {} point(s) - nothing to create".format(len(points)))
+    if not points and not (start_node is not None and end_node is not None):
+        _log("no points and nothing to join - nothing to create")
         return []
 
     undo = nuke.Undo()
@@ -768,12 +1232,40 @@ def create_dot_chain(points, start_node=None, end_node=None):
             previous = dot
             dots.append(dot)
 
-        if end_node is not None and dots:
-            try:
-                end_node.setInput(0, dots[-1])
-            except Exception:
-                _log("could not wire {} - {}".format(
-                    end_node.name(), traceback.format_exc()))
+        if end_node is not None and (dots or start_node is not None):
+            index = end_input
+            if index is None:
+                index = _free_input(end_node)
+            if index is None:
+                _log("{} has no free input - left unconnected".format(
+                    end_node.name()))
+            else:
+                # setInput returns False rather than raising when Nuke
+                # refuses - a cycle, or an input that cannot take this
+                # node. Read the connection back instead of trusting it,
+                # or a half-made splice looks like a finished one.
+                # With no Dots at all the route was a straight run, so
+                # the two nodes are simply joined to each other.
+                if not dots:
+                    wanted = start_node
+                else:
+                    wanted = dots[0] if insert_at_first else dots[-1]
+                try:
+                    end_node.setInput(index, wanted)
+                    landed = end_node.input(index) is wanted
+                except Exception:
+                    landed = False
+                    _log("setInput raised:")
+                    _log(traceback.format_exc())
+                if landed:
+                    _log("wired {} {}".format(
+                        end_node.name(), _input_label(end_node, index)))
+                else:
+                    print("[DD] COULD NOT WIRE {} {} - Nuke refused the "
+                          "connection. The chain is left unattached at "
+                          "that end.".format(
+                              end_node.name(),
+                              _input_label(end_node, index)))
 
         for dot in dots:
             dot.setSelected(True)
@@ -990,6 +1482,26 @@ class _Filter(QtCore.QObject):
         QtCore.QTimer.singleShot(
             0, lambda: self._prompt(raw_dag, transform, overlay))
 
+    def _commit_without_panel(self, raw_dag, prefs, start_node,
+                              end_node, end_input, inserting):
+        """Build and place the Dots directly, using the saved settings."""
+        connect = bool(prefs["connect"]) and bool(start_node or end_node)
+        points = _build_points(
+            raw_dag,
+            tolerance=float(prefs["tolerance"]),
+            orthogonal=bool(prefs["ortho"]),
+            grid=int(prefs["grid"]) if prefs["snap"] else 0,
+            connect=connect, start_node=start_node, end_node=end_node)
+
+        if connect and inserting == "end":
+            points = list(reversed(points))
+
+        create_dot_chain(points,
+                         start_node if connect else None,
+                         end_node if connect else None,
+                         end_input if connect else None,
+                         insert_at_first=bool(connect and inserting))
+
     def _prompt(self, raw_dag, transform, overlay):
         """
         Offer the simplify panel, then commit the path if accepted.
@@ -1000,19 +1512,34 @@ class _Filter(QtCore.QObject):
         clicked away.
         """
         try:
-            start_node = end_node = None
-            if CONNECT_ENDS:
-                start_node = _node_near(raw_dag[0][0], raw_dag[0][1],
-                                        CONNECT_RADIUS)
-                end_node = _node_near(raw_dag[-1][0], raw_dag[-1][1],
-                                      CONNECT_RADIUS, need_input=True)
-                if end_node is not None and end_node is start_node:
-                    end_node = None
+            (start_node, end_node,
+             end_input, inserting) = _resolve_connections(raw_dag)
+
+            prefs = _prefs_get()
+            if not prefs["ask"]:
+                # Straight to Dots using the saved settings. Nodes toolbar
+                # -> Other -> Draw Dots Settings turns the panel back on.
+                self._commit_without_panel(raw_dag, prefs, start_node,
+                                           end_node, end_input, inserting)
+                return
 
             dialog = _SimplifyDialog(raw_dag, transform, overlay,
-                                     start_node, end_node)
-            dialog.move(int(transform.gx) + 24,
-                        int(transform.gy + transform.h) - 190)
+                                     start_node, end_node, end_input,
+                                     inserting)
+
+            # Put the panel beside what was just drawn, not in a fixed
+            # corner - on a wide Node Graph a corner panel can be a long
+            # way from the stroke it controls.
+            points = [transform.dag_to_local(x, y) for x, y in raw_dag]
+            xs = [transform.gx + p[0] for p in points]
+            ys = [transform.gy + p[1] for p in points]
+            stroke_rect = QtCore.QRect(
+                QtCore.QPoint(int(min(xs)), int(min(ys))),
+                QtCore.QPoint(int(max(xs)), int(max(ys))))
+
+            dialog.adjustSize()
+            dialog.move(_panel_position(dialog.sizeHint(), stroke_rect,
+                                        _screen_rect(stroke_rect.center())))
 
             accepted = _exec(dialog) == QtWidgets.QDialog.Accepted
             points = list(dialog.points)
@@ -1023,9 +1550,17 @@ class _Filter(QtCore.QObject):
                 _log("cancelled")
                 return
 
+            if connect and inserting == "end":
+                # The Dot on the line is the last one drawn. Reverse so it
+                # leads the chain; positions are per-point, so only the
+                # wiring order changes, not where anything sits.
+                points = list(reversed(points))
+
             create_dot_chain(points,
                              start_node if connect else None,
-                             end_node if connect else None)
+                             end_node if connect else None,
+                             end_input if connect else None,
+                             insert_at_first=bool(connect and inserting))
         except Exception:
             _log("exception while committing the path:\n{}".format(
                 traceback.format_exc()))

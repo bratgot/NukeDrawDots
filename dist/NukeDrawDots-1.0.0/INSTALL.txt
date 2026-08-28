@@ -35,16 +35,30 @@ USE
 ---
   Shift+D         Arm the tool (cursor becomes a crosshair)
   Click + drag    Draw the path
-  Release         The Draw Dots panel opens, previewing the result
+  Release         The Dots appear
   Escape          Cancel at any point
   Right-click     Cancel at any point
 
 Nodes toolbar -> Other -> Draw Dots
     Arms the tool without the keyboard shortcut.
 
+Nodes toolbar -> Other -> Draw Dots Settings...
+    Simplify strength, right angles, grid snap and connecting. Set once
+    and remembered between sessions - a stroke goes straight to Dots
+    without stopping to ask. Turn on "Show this panel after every stroke"
+    if you would rather confirm each path against a live preview.
 
-THE PANEL
----------
+    The panel is not modal: leave it open beside the Node Graph and keep
+    drawing. There is no OK button - every change is saved as you make it
+    and applies to the next stroke.
+
+
+SETTINGS
+--------
+By default a stroke becomes Dots straight away, using whatever is set in
+Draw Dots Settings. Turn on "Show this panel after every stroke" there and
+the panel below opens on each release instead.
+
 Everything in the panel previews live over the Node Graph. The faint grey
 line is the stroke you drew; the orange line and circles are the Dots you
 are about to get.
@@ -61,9 +75,16 @@ are about to get.
                   chain lines up with nodes you placed by hand.
 
   Connect ...     If the stroke started on a node, the first Dot is wired
-                  to it. If it ended on a node, that node's first input is
-                  wired to the last Dot. The checkbox names whatever was
-                  found, and is greyed out when neither end landed on
+                  to it. If it ended on a node, the chain goes into that
+                  node's first FREE input - an existing connection is
+                  never overwritten, and a Merge's mask is skipped.
+
+                  End the stroke on a pipe instead and the chain is
+                  spliced into it: upstream -> dots -> downstream.
+
+                  No Dot is placed on a node you connect to; drawing onto
+                  it is the connect gesture. The checkbox names whatever
+                  was found and is greyed out when neither end landed on
                   anything.
 
 Create commits the chain as a single undo step, so one Ctrl+Z removes all
@@ -127,6 +148,9 @@ At the top of nuke_draw_dots.py:
   DEFAULT_GRID      = 16                starting grid size
   CONNECT_ENDS      = True              look for nodes under the ends
   CONNECT_RADIUS    = 45                how near an end has to be
+  PIPE_RADIUS       = 30                how near an end has to be to a pipe
+  TRIM_PADDING      = 30                clearance kept around a connected node
+  STRAIGHT_TOL      = 12                how far off-line a Dot must be to keep
   DEBUG             = False             print [DD] trace lines
 
 The DEFAULT_ values seed the panel the first time only; after that the

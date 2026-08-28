@@ -8,3 +8,6 @@ __pycache__/
 
 # Nukepedia submission draft - kept locally, not published in the repo.
 NUKEPEDIA.txt
+
+# Local Nuke scripts used for hand-testing - not part of the tool.
+NukeTest/

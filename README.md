@@ -73,12 +73,27 @@ Restart Nuke, or run `nuke_draw_dots.install()` from the Script Editor to load w
 1. Click in the Node Graph so it has focus
 2. Press **`Shift+D`** — the cursor becomes a crosshair
 3. **Click and drag** to draw the path you want the dots to follow
-4. Release — the **Draw Dots** panel opens with a live preview
-5. Set the controls, then hit **Create**
+4. Release — the dots appear
 
 > Press `Escape` or right-click at any point to cancel.
 
-The faint grey line is the stroke you drew. The orange line and circles are the dots you're about to get, redrawn as you move the controls.
+By default there's nothing to confirm: the stroke becomes dots using your saved settings. Change those in **Nodes toolbar → Other → Draw Dots Settings…**
+
+### Settings
+
+| Control | What it does |
+|---------|--------------|
+| **Simplify** | How far the path may stray from your stroke, in Node Graph units. `0` keeps every sample of the drag. |
+| **Right angles** | Snap every segment to horizontal or vertical. On by default. |
+| **Snap to grid** | Round every dot to a multiple of the grid size. Off by default. |
+| **Connect to nodes and pipes** | Wire the chain into whatever the stroke starts and ends on. |
+| **Show this panel after every stroke** | Off by default. Turn it on to confirm each path against a live preview before committing. |
+
+The panel is **non-modal**, so you can leave it open beside the Node Graph and keep drawing. There's no OK button — every change is written the moment you make it and applies to the next stroke. Settings live in `~/.nuke/nuke_draw_dots_prefs.json` and are restored next time Nuke starts; delete that file to reset.
+
+### Confirming each stroke
+
+With **Show this panel after every stroke** turned on, releasing the drag opens the panel instead of committing straight away. The faint grey line is the stroke you drew; the orange line and circles are the dots you're about to get, redrawn as you move the controls. It carries the same controls plus a live dot count, and **Create** commits.
 
 ### The panel
 
@@ -91,8 +106,6 @@ The faint grey line is the stroke you drew. The orange line and circles are the 
 
 Create commits the chain as a single undo step and leaves the new dots selected.
 
-Panel settings are written to `~/.nuke/nuke_draw_dots_prefs.json` and restored next time Nuke starts. Delete that file to reset.
-
 ### Connecting to existing nodes
 
 Both ends are geometric, not selection-based — you connect by *where you draw*, not by what you selected first:
@@ -100,7 +113,21 @@ Both ends are geometric, not selection-based — you connect by *where you draw*
 - Start the stroke **on a node** → the first dot takes that node's output.
 - End the stroke **on a node** → that node's input 0 is rewired to the last dot.
 
-An end has to land within `CONNECT_RADIUS` (45 Node Graph units) of a node's box. Backdrops and sticky notes are ignored, so a stroke drawn across a backdrop still finds the nodes inside it. The end-node search skips anything that can't take an input, so a `Read` under the end of your stroke won't be picked up by mistake.
+An end has to land within `CONNECT_RADIUS` (45 Node Graph units) of a node's box. Backdrops and sticky notes are ignored, so a stroke drawn across a backdrop still finds the nodes inside it.
+
+**Dots mark corners, nothing else.** Draw straight from one node to another and you get no dots at all — just the connection. The two node centres act as the route's real endpoints, so a dot that doesn't bend the path away from the line between them is redundant and is dropped (`STRAIGHT_TOL`, 12 Node Graph units, which also absorbs hand wobble). A route that genuinely turns keeps a dot at every corner.
+
+**No dot is placed on or near a node you're connecting to.** Drawing onto a node is how you say "connect here" — a Dot sitting on it, or parked against its edge, is clutter rather than routing. Points falling within `TRIM_PADDING` (30 Node Graph units) of either end node are dropped. The margin is measured from the node's box, and is wide enough that a dot never appears to touch the node while still leaving room for one in the gap between two stacked nodes. Only the ends are trimmed; a stroke deliberately routed over a node in the middle keeps its dots. The preview shows the trimmed result, so what you see is what gets built.
+
+**Draw onto a pipe to splice into it.** Start *or* end the stroke on an existing connection and the chain is inserted into it — upstream → dots → downstream — taking over that pipe, the way dropping a node on a connection works in Nuke. If the stroke *also* started on a node, that node is kept as the source instead of the pipe's upstream: you drew from it deliberately. The tool refuses to splice a node into the pipe that feeds it, which would make a loop.
+
+The dot that lands **on the line** is the one spliced in: the connection runs `upstream → that dot → downstream`. Every dot drawn after it hangs off it as a branch, and **the far end is left free** for you to wire up by hand. Wiring the last dot instead would make the connection detour out to wherever your stroke finished and come back, which is a diversion rather than an insertion.
+
+Either end of the stroke works. Start on a pipe and drag away — "pull a route out of this connection to here" — or end on one. When the pipe is under the stroke's end, the chain is reversed before wiring so the on-line dot still leads it.
+
+What wins where matters, because these tests overlap. Landing squarely **on** a node (`ON_NODE_RADIUS`, 6 units) connects to that node. Otherwise a pipe within `PIPE_RADIUS` (30) is spliced. Only if neither hits does a node merely *near* the end (`CONNECT_RADIUS`, 45) get connected. The order is deliberate: two nodes a short distance apart sit within 45 units of every point on the pipe between them, so letting proximity win would make that pipe impossible to draw onto.
+
+**Free pipes only.** The end node is wired into its first *unconnected* input, not blindly into input 0. Draw into a Merge whose B is already fed and the chain lands in A; the existing link is never overwritten. The mask input is skipped — on a Merge it sits between A and the extra A inputs, and routing an image into it is never what a stroke meant. A node with every pipe taken isn't offered as a target at all, so a connection can't silently break an existing one. The checkbox names the pipe it will use.
 
 ---
 
