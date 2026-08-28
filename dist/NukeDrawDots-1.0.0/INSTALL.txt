@@ -1,0 +1,138 @@
+NukeDrawDots 1.0.0
+==========================
+
+Draw a freehand path in the Node Graph and turn it into a chain of
+connected Dot nodes. Nuke 14.1 through 17.1, MIT licensed.
+
+Verified in live Nuke 14.1v8 and 17.1v1 sessions - one per Qt binding.
+
+https://github.com/bratgot/NukeDrawDots
+
+
+INSTALL
+-------
+1. Copy nuke_draw_dots.py into your ~/.nuke/ folder.
+
+   Windows:  %USERPROFILE%\.nuke\
+   Linux:    ~/.nuke/
+   macOS:    ~/.nuke/
+
+2. Copy menu.py into the same folder.
+
+   IMPORTANT: if you ALREADY have a ~/.nuke/menu.py, do not overwrite it.
+   Open both files and append the contents of this menu.py to the end of
+   your existing one instead.
+
+3. Restart Nuke.
+
+To load without restarting, run this in the Script Editor:
+
+    import nuke_draw_dots
+    nuke_draw_dots.install()
+
+
+USE
+---
+  Shift+D         Arm the tool (cursor becomes a crosshair)
+  Click + drag    Draw the path
+  Release         The Draw Dots panel opens, previewing the result
+  Escape          Cancel at any point
+  Right-click     Cancel at any point
+
+Nodes toolbar -> Other -> Draw Dots
+    Arms the tool without the keyboard shortcut.
+
+
+THE PANEL
+---------
+Everything in the panel previews live over the Node Graph. The faint grey
+line is the stroke you drew; the orange line and circles are the Dots you
+are about to get.
+
+  Simplify        How far the path may stray from your stroke, in Node
+                  Graph units. 0 keeps every sample. Drag it up until the
+                  dot count looks right.
+
+  Right angles    Snap every segment to horizontal or vertical, so the
+                  chain routes like a circuit board rather than following
+                  your hand. On by default.
+
+  Snap to grid    Round every Dot to a multiple of the grid size, so the
+                  chain lines up with nodes you placed by hand.
+
+  Connect ...     If the stroke started on a node, the first Dot is wired
+                  to it. If it ended on a node, that node's first input is
+                  wired to the last Dot. The checkbox names whatever was
+                  found, and is greyed out when neither end landed on
+                  anything.
+
+Create commits the chain as a single undo step, so one Ctrl+Z removes all
+of it. The new Dots are left selected.
+
+Panel settings are remembered between Nuke sessions in
+~/.nuke/nuke_draw_dots_prefs.json - delete that file to reset.
+
+
+TROUBLESHOOTING
+--------------
+Two diagnostics are built in. Run them in the Script Editor of the Nuke
+that is misbehaving:
+
+    import nuke_draw_dots
+    nuke_draw_dots.diagnose()
+
+Prints the Nuke, Python and Qt versions, whether the event filter is
+installed, and every widget it recognises as a Node Graph. It searches
+the whole application, so the Node Graph does not need focus. If it says
+NOTHING MATCHED, it then lists the largest visible widgets - that list is
+what to report.
+
+    nuke_draw_dots.key_probe()
+
+Watches keys and mouse buttons for 15 seconds. Click, drag and press the
+shortcut in the Node Graph. No line for the key means something else has
+claimed it; no PRESS line when you click means an application-level event
+filter cannot see this Nuke's input at all.
+
+To try a different key without editing the file or restarting:
+
+    nuke_draw_dots.set_shortcut("E")     # Shift+E for this session
+
+Once one works, set SHORTCUT_KEY at the top of nuke_draw_dots.py and the
+hotkey in menu.py to match.
+
+For anything else, set DEBUG = True and watch for [DD] lines.
+
+
+NOTES
+-----
+No third-party packages are needed. The Qt binding is detected at import:
+PySide6 on Nuke 16+, PySide2 on 14-15.
+
+The "shift+d" hotkey on the toolbar command is a fallback. While the Node
+Graph has focus the event filter claims Shift+D first, so the key and the
+menu command do the same thing.
+
+
+CONFIGURATION
+-------------
+At the top of nuke_draw_dots.py:
+
+  SHORTCUT_KEY      = QtCore.Qt.Key_D   the key that arms the tool
+  REQUIRE_MODIFIER  = ShiftModifier     the modifier it needs
+  MIN_SAMPLE_PX     = 3                 screen px between stroke samples
+  DEFAULT_TOLERANCE = 12                starting Simplify amount
+  DEFAULT_ORTHO     = True              start with right angles on
+  DEFAULT_SNAP      = False             start with grid snapping off
+  DEFAULT_GRID      = 16                starting grid size
+  CONNECT_ENDS      = True              look for nodes under the ends
+  CONNECT_RADIUS    = 45                how near an end has to be
+  DEBUG             = False             print [DD] trace lines
+
+The DEFAULT_ values seed the panel the first time only; after that the
+prefs file wins.
+
+
+LICENSE
+-------
+MIT - see LICENSE.

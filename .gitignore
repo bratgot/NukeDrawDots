@@ -1,0 +1,10 @@
+# Release archives are build artifacts - rebuild with tools/build_dist.py.
+# The staged folder under dist/ IS committed, so the files stay browsable
+# on GitHub without downloading anything.
+dist/*.zip
+
+__pycache__/
+*.py[co]
+
+# Nukepedia submission draft - kept locally, not published in the repo.
+NUKEPEDIA.txt
